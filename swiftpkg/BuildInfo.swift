@@ -126,6 +126,21 @@ public struct PackageConfiguration: Sendable {
         notarization = try Self.notarizationConfiguration(in: values)
     }
 
+    /// Returns a copy with dynamic version tokens (${TIMESTAMP}/${DATE}/${DATETIME})
+    /// resolved in the version field, before `${version}` name substitution.
+    public func resolvingDynamicVersion(now: Date = Date()) -> PackageConfiguration {
+        let resolved = DynamicVersion.resolve(version, now: now)
+        guard resolved != version else { return self }
+        return PackageConfiguration(
+            name: name, identifier: identifier, version: resolved, ownership: ownership,
+            installLocation: installLocation, compression: compression, minimumOSVersion: minimumOSVersion,
+            usesLargePayload: usesLargePayload, postInstallAction: postInstallAction,
+            preservesExtendedAttributes: preservesExtendedAttributes, suppressesBundleRelocation: suppressesBundleRelocation,
+            usesDistributionStyle: usesDistributionStyle, title: title, productIdentifier: productIdentifier,
+            signing: signing, notarization: notarization
+        )
+    }
+
     /// Returns a copy with `${version}` substituted in user-facing name fields.
     public func substitutingVersion() -> PackageConfiguration {
         func replacingVersion(in value: String?) -> String? {
@@ -234,7 +249,7 @@ private extension NotarizationConfiguration {
 public enum BuildInfoStore {
     public static func load(from project: URL, requestedFormat: BuildInfoFormat?, fileManager: FileManager = .default) throws -> PackageConfiguration {
         let document = try discover(in: project, requestedFormat: requestedFormat, fileManager: fileManager)
-        return try loadTemplate(from: document.url, defaultsFor: project).substitutingVersion()
+        return try loadTemplate(from: document.url, defaultsFor: project).resolvingDynamicVersion().substitutingVersion()
     }
 
     public static func loadTemplate(from project: URL, requestedFormat: BuildInfoFormat? = nil, fileManager: FileManager = .default) throws -> PackageConfiguration {
