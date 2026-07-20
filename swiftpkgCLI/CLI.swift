@@ -36,6 +36,15 @@ public struct CLIOptions: ParsableArguments {
     @Flag(name: .long, help: "Skip stapling after notarization.")
     public var skipStapling = false
 
+    @Option(name: .customLong("env"), help: "Path to a .env file of build-time variables (default: <project>/.env).")
+    public var environmentFile: String?
+
+    @Flag(name: .customLong("no-system-env"), help: "Do not merge MUNKIPKG_* variables from the environment.")
+    public var noSystemEnv = false
+
+    @Flag(name: .customLong("strict-env"), help: "Fail the build if any script placeholder is unresolved.")
+    public var strictEnv = false
+
     @Flag(name: .long, help: "Show program's version number and exit.")
     public var version = false
 
@@ -84,7 +93,10 @@ public enum CLICommand {
                 isQuiet: options.quiet,
                 skipsSigning: options.skipSigning,
                 skipsNotarization: options.skipNotarization,
-                skipsStapling: options.skipStapling
+                skipsStapling: options.skipStapling,
+                environmentFilePath: options.environmentFile,
+                includesSystemEnvironment: !options.noSystemEnv,
+                strictEnvironment: options.strictEnv
             )
         )
     }
@@ -119,6 +131,9 @@ public enum CLIParser {
       --skip-signing          Skip configured package signing.
       --skip-notarization     Skip configured notarization.
       --skip-stapling         Skip stapling after notarization.
+      --env PATH              Path to a .env file of build-time variables.
+      --no-system-env         Do not merge MUNKIPKG_* environment variables.
+      --strict-env            Fail the build on any unresolved placeholder.
     """
 
     public static func parse(_ arguments: [String]) -> CLIParseResult {
