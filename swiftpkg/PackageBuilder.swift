@@ -21,9 +21,20 @@ public struct PackageBuildCoordinator: @unchecked Sendable {
         let layout = try PackageProjectLayout(project: project, fileManager: fileManager)
         try layout.createBuildDirectoryIfNeeded()
         try await layout.withTemporaryDirectory { temporaryDirectory in
-            let context = PackageBuildContext(configuration: packageConfiguration, layout: layout, temporaryDirectory: temporaryDirectory)
             let scriptPreparer = ScriptPreparer(fileManager: fileManager, console: console)
             if let scripts = layout.scripts { try scriptPreparer.prepareScripts(in: scripts) }
+            let processedScripts = try ScriptEnvironmentInjector(console: console).injectedScripts(
+                originalScripts: layout.scripts,
+                project: project,
+                options: configuration,
+                temporaryDirectory: temporaryDirectory
+            )
+            let context = PackageBuildContext(
+                configuration: packageConfiguration,
+                layout: layout,
+                temporaryDirectory: temporaryDirectory,
+                scriptsOverride: processedScripts
+            )
             try ComponentPackageBuilder(fileManager: fileManager, runner: runner, console: console)
                 .buildComponent(using: context, isQuiet: configuration.isQuiet, skipsSigning: configuration.skipsSigning)
             if configuration.exportsBOM {
@@ -88,8 +99,12 @@ private struct PackageBuildContext {
     let configuration: PackageConfiguration
     let layout: PackageProjectLayout
     let temporaryDirectory: URL
+    /// When env substitution runs, the processed scripts directory to hand to
+    /// `pkgbuild` instead of the project's original scripts folder.
+    var scriptsOverride: URL?
 
     var output: URL { layout.buildDirectory.appendingPathComponent(configuration.name) }
+    var effectiveScripts: URL? { scriptsOverride ?? layout.scripts }
 }
 
 /// Normalizes installer scripts before package construction.
@@ -109,6 +124,61 @@ private struct ScriptPreparer {
                 try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
             }
         }
+    }
+}
+
+/// Substitutes build-time variables into installer scripts before packaging,
+/// mirroring the munki-pkg `.env` + `MUNKIPKG_*` environment feature. Returns the
+/// processed scripts directory to hand to `pkgbuild`, or nil to use the originals.
+private struct ScriptEnvironmentInjector {
+    let console: Console
+
+    func injectedScripts(originalScripts: URL?, project: URL, options: PackageBuildOptions, temporaryDirectory: URL) throws -> URL? {
+        let envExplicit = options.environmentFilePath != nil
+        let envFilePath = options.environmentFilePath ?? project.appendingPathComponent(".env").path
+        if envExplicit, !FileManager.default.fileExists(atPath: envFilePath) {
+            throw MunkiPkgError.message("Specified environment file does not exist: \(envFilePath)")
+        }
+
+        let envFileVars = try EnvLoader.load(from: envFilePath)
+        let merged = EnvLoader.merge(envFileVars: envFileVars, includeSysEnv: options.includesSystemEnvironment)
+
+        if !envFileVars.isEmpty {
+            console.display("Loaded \(envFileVars.count) build-time variable(s) from \(envFilePath)")
+        } else if envExplicit {
+            console.warning("Environment file \(envFilePath) contained no variables.")
+        }
+        if !merged.systemEnvKeys.isEmpty {
+            console.display("Picked up \(merged.systemEnvKeys.count) \(EnvLoader.systemEnvPrefix)* var(s) from the environment: \(merged.systemEnvKeys.joined(separator: ", "))")
+        }
+        if EnvLoader.containsSecretLikeKey(merged.vars.keys) {
+            console.warning("One or more variable names look secret-like. Substituted values end up as plain text inside the built .pkg (readable via `pkgutil --expand`). Use this for build-time configuration only; fetch real secrets at runtime from Keychain or an MDM-delivered profile.")
+        }
+
+        guard let scriptsURL = originalScripts else { return nil }
+
+        var unresolvedByScript: [String: Set<String>] = [:]
+        var processed: URL?
+
+        if !merged.vars.isEmpty,
+           let result = try PlaceholderReplacer.processScriptsDirectory(
+               at: scriptsURL.path, with: merged.vars, tempDir: temporaryDirectory.path) {
+            unresolvedByScript = result.unresolvedByScript
+            processed = URL(fileURLWithPath: result.scriptsDir, isDirectory: true)
+        } else if options.strictEnvironment {
+            unresolvedByScript = PlaceholderReplacer.scanScriptsDirectory(at: scriptsURL.path)
+        }
+
+        if !unresolvedByScript.isEmpty {
+            for (scriptName, keys) in unresolvedByScript.sorted(by: { $0.key < $1.key }) {
+                console.warning("Unresolved placeholder(s) in \(scriptName): \(keys.sorted().joined(separator: ", "))")
+            }
+            if options.strictEnvironment {
+                throw MunkiPkgError.message("--strict-env: one or more script placeholders had no matching environment variable")
+            }
+        }
+
+        return processed
     }
 }
 
@@ -134,7 +204,7 @@ private struct ComponentPackageBuilder {
         if let compression = context.configuration.compression { arguments += ["--compression", compression.rawValue] }
         if let minimumOSVersion = context.configuration.minimumOSVersion { arguments += ["--min-os-version", minimumOSVersion] }
         if context.configuration.usesLargePayload { arguments.append("--large-payload") }
-        if let scripts = context.layout.scripts { arguments += ["--scripts", scripts.path] }
+        if let scripts = context.effectiveScripts { arguments += ["--scripts", scripts.path] }
         if isQuiet { arguments.append("--quiet") }
         if !context.configuration.usesDistributionStyle, !skipsSigning { appendSigningArguments(&arguments, signing: context.configuration.signing) }
         arguments.append(context.output.path)
